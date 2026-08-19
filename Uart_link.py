@@ -4,8 +4,8 @@ import time
 
 # ================= 配置 =================
 UART_ID = 0
-UART_TX = 0
-UART_RX = 1
+UART_TX = 16
+UART_RX = 17
 UART_BAUD = 921600
 
 NUM_ESC = 4
