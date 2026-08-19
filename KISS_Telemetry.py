@@ -12,10 +12,10 @@ import utime
 # 配置
 # ============================================================
 PIO_RX_CONFIG = {
-    "ESC1": {"sm_id": 0, "pin": 4},
-    "ESC2": {"sm_id": 1, "pin": 5},
-    "ESC3": {"sm_id": 2, "pin": 6},
-    "ESC4": {"sm_id": 3, "pin": 7},
+    "ESC1": {"sm_id": 0, "pin": 2},
+    "ESC2": {"sm_id": 1, "pin": 6},
+    "ESC3": {"sm_id": 2, "pin": 10},
+    "ESC4": {"sm_id": 3, "pin": 14},
 }
 # sm_id 0~3 属于 PIO0，DShot那边用 sm_id 4~7（对应PIO1）
 
