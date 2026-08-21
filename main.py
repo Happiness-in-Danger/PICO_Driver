@@ -28,6 +28,7 @@ main.py —— PICO_Driver 系统调度层
 """
 
 import time
+import micropython
 from Uart_link import (
     UartLink,
     EscStatus,
@@ -47,6 +48,15 @@ micropython.alloc_emergency_exception_buf(100)
 # 注意: 必须避开 KISS_Telemetry.py 里硬编码的 GPIO2~6~10~14 (那是独立的
 # KISS遥测输入线，需要单独接线到 ESC 的 telemetry 输出脚)。
 MOTOR_PINS = [3, 7, 11, 15]
+
+if NUM_ESC > len(MOTOR_PINS_ALL):
+    raise ValueError(
+        "MOTOR_PINS_ALL 只配置了 %d 路引脚，NUM_ESC=%d 超出，"
+        "请先在这里补上对应引脚" % (len(MOTOR_PINS_ALL), NUM_ESC)
+    )
+ 
+MOTOR_PINS = MOTOR_PINS_ALL[:NUM_ESC]
+ESC_NAMES = ["ESC%d" % (i + 1) for i in range(NUM_ESC)]
 
 POLE_PAIRS = 1
 UPDATE_HZ = 2000                # BDShot 内部 Timer 更新率
