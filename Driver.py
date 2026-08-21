@@ -14,7 +14,7 @@ UART_BAUD = 921600
 # 两块MCU是各自独立的代码，没有办法共享同一个常量，只能人工同步。
 # 改了这里一定要记得同时改 Pico 端，否则 device_id 过滤范围两边不一致，
 # 会出现"Pico发的某些ESC状态帧被H743当非法ID丢弃"或反之的情况。
-NUM_ESC = 2
+NUM_ESC = 3
 
 SYNC_CMD = 0xA5
 SYNC_STATUS = 0x5A
@@ -134,6 +134,9 @@ class UartLink:
         return self.link_ok
 
     def _apply_status_frame(self, buf):
+        # [eRPM uint16->uint32] 帧布局同步更新：eRPM占用buf[3:7]共4字节
+        # (原来buf[10]/buf[11]的保留字节被并入eRPM)，后面每个字段整体
+        # 前移2字节。帧总长度仍然是13字节，STATUS_FRAME_LEN不用改。
         device_id = buf[1]
 
         if device_id >= NUM_ESC:
@@ -146,10 +149,10 @@ class UartLink:
         st.bidir_valid = bool(flags & STATUS_FLAG_BIDIR_VALID)
         st.kiss_valid = bool(flags & STATUS_FLAG_KISS_VALID)
 
-        st.erpm = (buf[3] << 8) | buf[4]
-        st.temperature = buf[5]
-        st.voltage = ((buf[6] << 8) | buf[7]) / 100.0
-        st.current = ((buf[8] << 8) | buf[9]) / 100.0
+        st.erpm = (buf[3] << 24) | (buf[4] << 16) | (buf[5] << 8) | buf[6]
+        st.temperature = buf[7]
+        st.voltage = ((buf[8] << 8) | buf[9]) / 100.0
+        st.current = ((buf[10] << 8) | buf[11]) / 100.0
 
     def send_command(self, device_id, cmd):
         thr = max(0, min(0x07FF, int(cmd.throttle)))
