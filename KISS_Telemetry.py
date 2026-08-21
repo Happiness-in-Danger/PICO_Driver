@@ -7,6 +7,7 @@ PIO1 和PIO2 的8个状态机预留给 DShot 输出，互不冲突
 from machine import Pin
 import rp2
 import utime
+from Uart_link import NUM_ESC
 
 # ============================================================
 # 配置
@@ -18,6 +19,21 @@ PIO_RX_CONFIG = {
     "ESC4": {"sm_id": 3, "pin": 14},
 }
 # sm_id 0~3 属于 PIO0，DShot那边用 sm_id 4~7（对应PIO1）
+
+_ESC_NAMES_IN_ORDER = ["ESC1", "ESC2", "ESC3", "ESC4"]
+ 
+if NUM_ESC > len(_ESC_NAMES_IN_ORDER):
+    raise ValueError(
+        "KISS_Telemetry 最多支持 %d 路，NUM_ESC=%d 超出，"
+        "请检查 Uart_link.py 里的 NUM_ESC 或补充引脚映射"
+        % (len(_ESC_NAMES_IN_ORDER), NUM_ESC)
+    )
+ 
+# 只取前 NUM_ESC 路，其余路不占用PIO0状态机，也不需要接线。
+PIO_RX_CONFIG = {
+    name: PIO_RX_CONFIG_ALL[name]
+    for name in _ESC_NAMES_IN_ORDER[:NUM_ESC]
+}
 
 BAUDRATE = 115200
 FRAME_LEN = 10
@@ -124,10 +140,10 @@ class PioUartRx:
 
 
 # ============================================================
-# 初始化
+# 初始化（只按 NUM_ESC 初始化，不再无条件建4路）
 # ============================================================
 escs = {name: KissTelemParser(name) for name in PIO_RX_CONFIG}
-
+ 
 pio_rx = {}
 for name, cfg in PIO_RX_CONFIG.items():
     pio_rx[name] = PioUartRx(
