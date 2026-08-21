@@ -8,6 +8,11 @@ UART_TX = 16
 UART_RX = 17
 UART_BAUD = 921600
 
+# NUM_ESC 是整个 Pico 项目里 ESC 数量的唯一信息源：
+# KISS_Telemetry.py / main.py 都从这里 import NUM_ESC，不再各自硬编码。
+# 改这一个数字（2/3/4）即可切换实际运行的 ESC 路数。
+# 注意：H743 端 Driver.py 是独立的MCU/独立代码，没有共享import的办法，
+# 必须手动把 Driver.py 里的 NUM_ESC 改成完全相同的数值，否则两端协议对不上。
 NUM_ESC = 3
 
 SYNC_CMD = 0xA5
@@ -48,12 +53,15 @@ class EscStatus:
         self.kiss_valid = False
 
     def pack(self, device_id):
+        # [eRPM uint16->uint32] 原来buf[10]/buf[11]是恒为0的保留字节，
+        # 现在把它们并入eRPM，让eRPM变成完整的4字节uint32，帧总长度
+        # 仍然是13字节不变，不影响UART带宽和发送周期。
         flags = 0
         if self.bidir_valid:
             flags |= STATUS_FLAG_BIDIR_VALID
         if self.kiss_valid:
             flags |= STATUS_FLAG_KISS_VALID
-        erpm = max(0, min(0xFFFF, int(self.erpm)))
+        erpm = max(0, min(0xFFFFFFFF, int(self.erpm)))
         volt = max(0, min(0xFFFF, int(self.voltage * 100)))
         curr = max(0, min(0xFFFF, int(self.current * 100)))
 
@@ -61,15 +69,15 @@ class EscStatus:
         buf[0] = SYNC_STATUS
         buf[1] = device_id
         buf[2] = flags
-        buf[3] = (erpm >> 8) & 0xFF
-        buf[4] = erpm & 0xFF
-        buf[5] = self.temperature & 0xFF
-        buf[6] = (volt >> 8) & 0xFF
-        buf[7] = volt & 0xFF
-        buf[8] = (curr >> 8) & 0xFF
-        buf[9] = curr & 0xFF
-        buf[10] = 0
-        buf[11] = 0
+        buf[3] = (erpm >> 24) & 0xFF
+        buf[4] = (erpm >> 16) & 0xFF
+        buf[5] = (erpm >> 8) & 0xFF
+        buf[6] = erpm & 0xFF
+        buf[7] = self.temperature & 0xFF
+        buf[8] = (volt >> 8) & 0xFF
+        buf[9] = volt & 0xFF
+        buf[10] = (curr >> 8) & 0xFF
+        buf[11] = curr & 0xFF
         buf[-1] = crc8(buf[:-1])
         return buf
 
