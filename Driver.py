@@ -35,7 +35,7 @@ from pyb import UART
 import time
 
 # ================= 配置 =================
-UART_ID = 2
+UART_ID = 6
 UART_BAUD = 921600
 
 # 硬件上限固定为4路，必须和 Pico 端 Uart_link.py 的 MAX_ESC 保持一致。
@@ -54,6 +54,8 @@ STATUS_FLAG_ENABLED = 0x04
 
 CMD_ENABLE_BIT = 0x80
 CMD_THR_HI_MASK = 0x07
+THROTTLE_MIN = 48       # 电机有效调速下限，0 仅用于停机
+THROTTLE_MAX = 0x07FF   # 电机有效调速上限
 
 
 def crc8_update(crc, byte):
@@ -77,7 +79,7 @@ class EscStatus:
         "bidir_valid",
         "kiss_valid",
         "enabled",
-        "erpm",
+        "raw_erpm",
         "temperature",
         "voltage",
         "current",
@@ -87,7 +89,7 @@ class EscStatus:
         self.bidir_valid = False
         self.kiss_valid = False
         self.enabled = False
-        self.erpm = 0
+        self.raw_erpm = 0
         self.temperature = 0
         self.voltage = 0.0
         self.current = 0.0
@@ -130,6 +132,21 @@ class FrameReceiver:
                 del self.buf[0]
 
         return frames
+
+
+# Driver link 全局实例（供 main.py / 设备模块共享，避免循环导入）
+_driver_link = None
+
+def get_driver_link():
+    """惰性初始化 Driver link（失败降级）"""
+    global _driver_link
+    if _driver_link is None:
+        try:
+            _driver_link = UartLink()
+            print("[Driver] UART6 link 已初始化")
+        except Exception as e:
+            print("[Driver] 初始化失败，链路降级:", e)
+    return _driver_link
 
 
 class UartLink:
@@ -179,7 +196,7 @@ class UartLink:
         st.kiss_valid = bool(flags & STATUS_FLAG_KISS_VALID)
         st.enabled = bool(flags & STATUS_FLAG_ENABLED)
 
-        st.erpm = (buf[3] << 24) | (buf[4] << 16) | (buf[5] << 8) | buf[6]
+        st.raw_erpm = (buf[3] << 24) | (buf[4] << 16) | (buf[5] << 8) | buf[6]
         st.temperature = buf[7]
         st.voltage = ((buf[8] << 8) | buf[9]) / 100.0
         st.current = ((buf[10] << 8) | buf[11]) / 100.0
@@ -195,13 +212,24 @@ class UartLink:
         self.commands[device_id].throttle = 0
 
     def set_throttle(self, device_id, throttle):
-        """只有enabled=True时，这个throttle才会真正被Pico采用"""
-        self.commands[device_id].throttle = max(0, min(0x07FF, int(throttle)))
+        """只有enabled=True时，这个throttle才会真正被Pico采用
+        
+        Args:
+            device_id: 0-3
+            throttle: 0-2047（油门值）
+        """
+        throttle = int(throttle)
+        # 0 表示停机；只要请求运行，就不得落入 1-47 的无效区间。
+        self.commands[device_id].throttle = (
+            0 if throttle <= 0 else max(THROTTLE_MIN, min(THROTTLE_MAX, throttle))
+        )
 
     def send_command(self, device_id, cmd=None):
         """把 self.commands[device_id] (或显式传入的cmd) 编码发送给Pico"""
         c = cmd if cmd is not None else self.commands[device_id]
-        thr = max(0, min(0x07FF, int(c.throttle))) if c.enabled else 0
+        requested = int(c.throttle)
+        thr = (0 if requested <= 0 else
+               max(THROTTLE_MIN, min(THROTTLE_MAX, requested))) if c.enabled else 0
 
         buf = bytearray(CMD_FRAME_LEN)
         buf[0] = SYNC_CMD
@@ -215,6 +243,69 @@ class UartLink:
     def send_all_commands(self):
         for device_id in range(MAX_ESC):
             self.send_command(device_id)
+
+    # -------------------- Step5a: ESC 遥测数据换算与写入 state --------------------
+    def update_telemetry_to_state(self, state_module):
+        """
+        将 ESC 遥测数据换算后写入 state.state_data[16-31]
+
+        Args:
+            state_module: Board.state 模块引用
+
+        职责：
+        - erpm → rpm 换算（根据 state.ESC_TELEMETRY_CFG 列表配置）
+        - 电压/电流按配置倍率转换后 ×10 写入
+        - 无效通道 / 链路断 / 配置禁用字段写 999
+        """
+        if not self.link_ok:
+            # 链路断时所有 ESC 遥测标记为无效
+            for i in range(16, 32):
+                state_module.state_data[i] = 999
+            return
+
+        cfg_table = state_module.ESC_TELEMETRY_CFG
+
+        # 4 个 ESC × 4 字段
+        for esc_id in range(MAX_ESC):
+            status = self.statuses[esc_id]
+            base_idx = 16 + esc_id * 4  # ESC0→16, ESC1→20, ESC2→24, ESC3→28
+
+            cfg = cfg_table[esc_id] if esc_id < len(cfg_table) else {}
+            pole_pairs = cfg.get("pole_pairs", 1) or 1
+            erpm_scale = cfg.get("erpm_scale", 1.0) or 1.0
+            voltage_scale = cfg.get("voltage_scale", 1.0) or 1.0
+            current_scale = cfg.get("current_scale", 1.0) or 1.0
+
+            # erpm → rpm 换算（可配置）
+            if cfg.get("erpm", True) and status.raw_erpm != 0 and status.bidir_valid:
+                rpm = int(status.raw_erpm / pole_pairs * erpm_scale)
+            else:
+                rpm = 999
+
+            # 温度
+            if cfg.get("temp", True) and status.kiss_valid:
+                temp = status.temperature
+            else:
+                temp = 999
+
+            # 电压：帧内已是 V，按配置倍率后 ×10 写入
+            if cfg.get("voltage", True) and status.kiss_valid:
+                voltage = int(status.voltage * voltage_scale * 10)
+            else:
+                voltage = 999
+
+            # 电流：帧内已是 A，按配置倍率后 ×10 写入；ESC1/ESC2 由 ACS712 统一采样
+            if (cfg.get("current", True) and status.kiss_valid and
+                    status.current != 0 and esc_id not in (1, 2)):
+                current = int(status.current * current_scale * 10)
+            else:
+                current = 999
+
+            # 写入 state_data[16-31]
+            state_module.state_data[base_idx + 0] = rpm      # 反馈机械 rpm
+            state_module.state_data[base_idx + 1] = temp     # 温度 (°C)
+            state_module.state_data[base_idx + 2] = voltage  # 电压×10
+            state_module.state_data[base_idx + 3] = current  # 电流×10
 
 
 # ================= 使用示例 =================
