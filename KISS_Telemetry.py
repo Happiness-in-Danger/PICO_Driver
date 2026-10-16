@@ -1,39 +1,39 @@
 """
 KISS ESC 4路遥测读取 - RP2350 MicroPython
 全部使用 PIO0 的4个状态机做软件UART RX
-PIO1 和PIO2 的8个状态机预留给 DShot 输出，互不冲突
+PIO1 和PIO2 的状态机预留给 DShot 输出(BDShot主方案 + Signal_DShot降级方案)，
+互不冲突。
+
+硬件上限固定4路(MAX_ESC=4)，KISS_Telemetry 一直4路全部常驻运行，
+不会因为H743动态enable/disable某路而增减PIO资源——KISS遥测是独立
+备用遥测源，跟某一路是否被H743启用无关，一直在后台采集。
 """
 
 from machine import Pin
 import rp2
 import utime
-from Uart_link import NUM_ESC
+from Uart_link import MAX_ESC
 
 # ============================================================
-# 配置
+# 配置 —— GPIO以当前实际硬件接线为准
 # ============================================================
-PIO_RX_CONFIG = {
+PIO_RX_CONFIG_ALL = {
     "ESC1": {"sm_id": 0, "pin": 2},
     "ESC2": {"sm_id": 1, "pin": 6},
     "ESC3": {"sm_id": 2, "pin": 10},
     "ESC4": {"sm_id": 3, "pin": 14},
 }
-# sm_id 0~3 属于 PIO0，DShot那边用 sm_id 4~7（对应PIO1）
+# sm_id 0~3 属于 PIO0，DShot那边用 sm_id 4~11（PIO1/PIO2）
 
 _ESC_NAMES_IN_ORDER = ["ESC1", "ESC2", "ESC3", "ESC4"]
- 
-if NUM_ESC > len(_ESC_NAMES_IN_ORDER):
+
+if MAX_ESC != len(_ESC_NAMES_IN_ORDER):
     raise ValueError(
-        "KISS_Telemetry 最多支持 %d 路，NUM_ESC=%d 超出，"
-        "请检查 Uart_link.py 里的 NUM_ESC 或补充引脚映射"
-        % (len(_ESC_NAMES_IN_ORDER), NUM_ESC)
+        "KISS_Telemetry 配置了 %d 路，MAX_ESC=%d 不一致，"
+        "请检查 PIO_RX_CONFIG_ALL 的引脚映射" % (len(_ESC_NAMES_IN_ORDER), MAX_ESC)
     )
- 
-# 只取前 NUM_ESC 路，其余路不占用PIO0状态机，也不需要接线。
-PIO_RX_CONFIG = {
-    name: PIO_RX_CONFIG_ALL[name]
-    for name in _ESC_NAMES_IN_ORDER[:NUM_ESC]
-}
+
+PIO_RX_CONFIG = PIO_RX_CONFIG_ALL
 
 BAUDRATE = 115200
 FRAME_LEN = 10
@@ -140,10 +140,10 @@ class PioUartRx:
 
 
 # ============================================================
-# 初始化（只按 NUM_ESC 初始化，不再无条件建4路）
+# 初始化 —— 固定4路，全部常驻
 # ============================================================
 escs = {name: KissTelemParser(name) for name in PIO_RX_CONFIG}
- 
+
 pio_rx = {}
 for name, cfg in PIO_RX_CONFIG.items():
     pio_rx[name] = PioUartRx(

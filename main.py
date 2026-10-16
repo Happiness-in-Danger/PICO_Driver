@@ -4,32 +4,44 @@ main.py —— PICO_Driver 系统调度层
 整体数据流:
 
     H743
-      | UART 921600 (Uart_link.py 协议)
+      | UART 921600 (Uart_link.py 协议, 含ENABLE/DISABLE)
       v
     Pico main.py
-      | throttle[NUM_ESC]
+      | 每路: enabled / throttle
       v
-    BDShot.py (主方案, Bidirectional DShot600, PIO1+PIO2)
+    BDShot.py (主方案, Bidirectional DShot600, PIO1+PIO2, 固定4路)
       | ESC telemetry (erpm/voltage/current/temperature)
       v
-    合并 KISS_Telemetry.py (备用遥测, PIO0, 常驻运行)
+    合并 KISS_Telemetry.py (备用遥测, PIO0, 4路常驻运行)
       v
     EscStatus (Uart_link.py) -> UART -> H743
 
-故障降级:
+硬件规模:
+    固定 MAX_ESC=4，4路硬件资源(BDShot TX/RX、KISS RX)在开机时
+    全部初始化好、随时待命。H743实际用几路，通过UART命令帧里的
+    enable位随时启用/禁用，Pico程序本身不需要因为"少接几个电机"
+    而修改代码或重新烧录。
 
-    BDShot 单路遥测失效  -> 该路改用 KISS 遥测，油门继续走 BDShot TX
-    BDShot 整体失效/初始化失败
-        -> bdshot.stop() 释放 PIO1(SM4~7)
-        -> Signal_DShot.DShot600 xN 复用 PIO1(SM4~4+NUM_ESC-1) 做单向 DShot TX
-        -> 遥测全部依赖 KISS_Telemetry (PIO0, 与TX方案无关，一直在跑)
+故障降级(单路独立):
+    某一路 BDShot 遥测异常(该路超过 BDSHOT_STALE_MS 没有新的有效帧)
+        -> 只把这一路切到 Signal_DShot(单向DShot TX)，
+           其余路继续用 BDShot，互不影响。
+        -> 遥测转为依赖 KISS_Telemetry (PIO0，与TX方案无关，一直在跑)。
+        -> 不做运行时自动恢复，只能重启后重新走一次BDShot初始化。
+    BDShot 整体初始化失败(比如PIO资源冲突/硬件异常)
+        -> 4路全部直接使用 Signal_DShot，遥测全部依赖 KISS_Telemetry。
 
-ESC数量配置:
-    实际启用几路电机，由 Uart_link.py 里的 NUM_ESC 唯一决定
-    (2/3/4)。本文件里的 throttle 列表、BDShot names、MOTOR_PINS
-    都从 NUM_ESC 派生，不再写死4路。
+enable/disable:
+    - H743可以在运行过程中随时对任意一路发 enable/disable。
+    - disabled的通道，无论BDShot还是Signal_DShot，实际下发的throttle
+      都强制为0（在 Uart_link.py._apply_cmd_frame 和本文件双重保证）。
+    - UART链路超时：
+        100ms 无有效命令  -> 所有throttle清零，enabled状态保留
+        2000ms 无有效命令 -> 所有throttle清零，同时enabled也被清除
+      (以上均在 Uart_link.UartLink.poll_commands() 里实现)
 
-本文件不修改任何现有模块，只做调度/整合。
+本文件不修改 BDShot.py 的 PIO 汇编/DMA/底层时序，只使用它新增的
+disable_motor()/is_motor_active() 这两个纯Python层面的接口做单路降级。
 """
 
 import time
@@ -38,9 +50,9 @@ import micropython
 from Uart_link import (
     UartLink,
     EscStatus,
-    NUM_ESC,
+    MAX_ESC,
 )
-import KISS_Telemetry as kiss          # import 即启动 PIO0 的 NUM_ESC 路 KISS RX，常驻备用遥测源
+import KISS_Telemetry as kiss          # import 即启动 PIO0 的4路 KISS RX，常驻备用遥测源
 from BDShot import DShotBus
 import Signal_DShot as sig_mod         # 只用到其中的 DShot600 类，真正实例化延迟到需要降级时
 
@@ -49,41 +61,41 @@ micropython.alloc_emergency_exception_buf(100)
 # ============================================================
 # 配置
 # ============================================================
-# BDShot(主方案) 与 Signal_DShot(备用TX方案) 共用同一组物理信号线，
-# 两者互斥使用(降级时先 stop 主方案再启用备用方案)，不会同时驱动同一GPIO。
-# 注意: 必须避开 KISS_Telemetry.py 里硬编码的 GPIO2/6/10/14 (那是独立的
-# KISS遥测输入线，需要单独接线到 ESC 的 telemetry 输出脚)。
-#
-# MOTOR_PINS_ALL 是硬件上实际焊好的最多4路信号线引脚，顺序固定对应
-# ESC0/ESC1/ESC2/ESC3。改 NUM_ESC 时只截取前 NUM_ESC 个，不会因为
-# 减少/增加ESC数量而打乱已有ESC的引脚分配。
-MOTOR_PINS_ALL = [3, 7, 11, 15]
+# 硬件上实际焊好的4路信号线引脚，顺序固定对应 ESC0~ESC3。
+# 以当前项目最新硬件为准，不要恢复旧版GPIO。
+MOTOR_PINS = [3, 7, 11, 15]
+ESC_NAMES = ["ESC%d" % (i + 1) for i in range(MAX_ESC)]
 
-if NUM_ESC > len(MOTOR_PINS_ALL):
+if len(MOTOR_PINS) != MAX_ESC:
     raise ValueError(
-        "MOTOR_PINS_ALL 只配置了 %d 路引脚，NUM_ESC=%d 超出，"
-        "请先在这里补上对应引脚" % (len(MOTOR_PINS_ALL), NUM_ESC)
+        "MOTOR_PINS 配置了 %d 路引脚，MAX_ESC=%d 不一致" % (len(MOTOR_PINS), MAX_ESC)
     )
 
-MOTOR_PINS = MOTOR_PINS_ALL[:NUM_ESC]
-ESC_NAMES = ["ESC%d" % (i + 1) for i in range(NUM_ESC)]
+# 单路降级时，Signal_DShot 复用该路原本被BDShot占用的TX状态机
+# (global sm_id, pio_num)，与 BDShot.py 里 _SLOTS=((1,0),(1,1),(2,0),(2,1))
+# 算出的 tx_sm 完全对应：
+#   ESC0(motor0) -> PIO1 local_pair0 -> tx_sm = 1*4+0*2 = 4
+#   ESC1(motor1) -> PIO1 local_pair1 -> tx_sm = 1*4+1*2 = 6
+#   ESC2(motor2) -> PIO2 local_pair0 -> tx_sm = 2*4+0*2 = 8
+#   ESC3(motor3) -> PIO2 local_pair1 -> tx_sm = 2*4+1*2 = 10
+# disable_motor() 会先释放该 tx_sm/rx_sm，这里再原地复用 tx_sm 这一个
+# 状态机给 Signal_DShot，不会跟其余仍在用BDShot的通道冲突。
+DEGRADE_SM = [(4, 1), (6, 1), (8, 2), (10, 2)]
 
 POLE_PAIRS = 1
 UPDATE_HZ = 2000                # BDShot 内部 Timer 更新率
 
-BDSHOT_STALE_MS = 300           # 单路 BDShot 遥测超过这个时间没有新的有效帧 -> 判定该路 stale
-BDSHOT_GLOBAL_FAIL_MS = 1000    # 全部路同时 stale 超过这个时间 -> 判定BDShot整体失效，触发降级
+BDSHOT_STALE_MS = 300           # 单路 BDShot 遥测超过这个时间没有新的有效帧 -> 该路判定异常，触发单路降级
 KISS_STALE_MS = 1000            # 直接复用 KissTelemParser.is_alive() 的默认超时量级
 
-STATUS_PERIOD_MS = 2            # Pico -> H743 状态帧发送周期(每路)，NUM_ESC路一轮共 2*NUM_ESC ms，
-                                 # 13字节@921600bps约140us/帧，带宽远够用，可按需调大调小
+STATUS_PERIOD_MS = 2            # Pico -> H743 状态帧发送周期(每路)，MAX_ESC路一轮共 2*MAX_ESC ms
 
 MODE_BDSHOT = 0
 MODE_BACKUP = 1
 
 
 # ============================================================
-# BDShot 遥测新鲜度旁路监控（不修改 BDShot.py，只在外部采样计数器）
+# BDShot 遥测新鲜度旁路监控（不修改 BDShot.py 底层，只在外部采样计数器）
 # ============================================================
 class BdshotHealthTracker:
     def __init__(self, n):
@@ -101,12 +113,6 @@ class BdshotHealthTracker:
     def is_alive(self, i, timeout_ms=BDSHOT_STALE_MS):
         return time.ticks_diff(time.ticks_ms(), self._last_change_ms[i]) < timeout_ms
 
-    def all_stale_duration_ms(self):
-        """用"最近一次任意电机有新遥测"的时间做基准，
-        返回"所有电机都没有新遥测"已经持续了多久。"""
-        newest = max(self._last_change_ms)
-        return time.ticks_diff(time.ticks_ms(), newest)
-
 
 # ============================================================
 # 系统调度主体
@@ -114,18 +120,16 @@ class BdshotHealthTracker:
 class EscBridge:
     def __init__(self):
         self.link = UartLink()
-        self.throttle = [0] * NUM_ESC
+        self.statuses = [EscStatus() for _ in range(MAX_ESC)]
 
-        self.mode = MODE_BDSHOT
         self.bdshot = None
         self.bdshot_health = None
-        self.signal_escs = None   # 只有降级后才会创建
+        self.channel_mode = [MODE_BDSHOT] * MAX_ESC
+        self.signal_escs = [None] * MAX_ESC   # 只有降级的那一路才会被创建
 
         self._init_bdshot()
 
-        self.statuses = [EscStatus() for _ in range(NUM_ESC)]
-
-    # -------------------- 初始化 / 降级切换 --------------------
+    # -------------------- 初始化 / 单路降级切换 --------------------
     def _init_bdshot(self):
         try:
             self.bdshot = DShotBus(
@@ -134,71 +138,64 @@ class EscBridge:
                 names=ESC_NAMES,
                 pole_pairs=POLE_PAIRS,
             )
-            self.bdshot_health = BdshotHealthTracker(NUM_ESC)
-            self.mode = MODE_BDSHOT
-            print("[main] BDShot 主方案初始化成功, NUM_ESC=%d" % NUM_ESC)
+            self.bdshot_health = BdshotHealthTracker(MAX_ESC)
+            self.channel_mode = [MODE_BDSHOT] * MAX_ESC
+            print("[main] BDShot 主方案初始化成功, 固定4路")
         except Exception as e:
-            print("[main] BDShot 初始化失败，直接降级到备用方案:", e)
+            print("[main] BDShot 整体初始化失败，4路全部直接降级到 Signal_DShot:", e)
             self.bdshot = None
             self.bdshot_health = None
-            self._switch_to_backup()
+            for i in range(MAX_ESC):
+                self._degrade_channel(i)
 
-    def _switch_to_backup(self):
-        if self.mode == MODE_BACKUP:
+    def _degrade_channel(self, i):
+        """只把第i路从BDShot切到Signal_DShot，其余路不受影响。"""
+        if self.channel_mode[i] == MODE_BACKUP:
             return
-        print("[main] 降级: Signal_DShot(TX) + KISS_Telemetry(RX)")
+        print("[main] ESC%d 单路降级: BDShot -> Signal_DShot" % (i + 1))
 
-        if self.bdshot is not None:
+        if self.bdshot is not None and self.bdshot.is_motor_active(i):
             try:
-                self.bdshot.stop()   # 关 Timer + 关所有 tx_sm/rx_sm，释放对应的PIO SM
+                self.bdshot.disable_motor(i)   # 只关这一路的tx_sm/rx_sm，其余路PIO SM不受影响
             except Exception as e:
-                print("[main] bdshot.stop() 异常(继续降级):", e)
-            self.bdshot = None
-            self.bdshot_health = None
+                print("[main] bdshot.disable_motor(%d) 异常(继续降级):" % i, e)
 
-        # Signal_DShot 改用 PIO1 的SM(全局id 4~4+NUM_ESC-1)，此时 BDShot
-        # 已经 stop()，这些SM已经释放，不会和残留的BDShot状态冲突。
-        # NUM_ESC<4 时，PIO1剩余的SM和PIO2完全空闲，未使用。
-        self.signal_escs = []
-        for i, pin in enumerate(MOTOR_PINS):
-            esc = sig_mod.DShot600(pin_num=pin, sm_id=4 + i, pio_num=1)
-            self.signal_escs.append(esc)
-        self.mode = MODE_BACKUP
+        sm_id, pio_num = DEGRADE_SM[i]
+        self.signal_escs[i] = sig_mod.DShot600(
+            pin_num=MOTOR_PINS[i], sm_id=sm_id, pio_num=pio_num
+        )
+        self.channel_mode[i] = MODE_BACKUP
 
     # -------------------- 每个主循环 tick 调用一次 --------------------
     def step(self):
-        self._update_commands()
+        self.link.poll_commands()
         self._drive_escs()
-        if self.mode == MODE_BDSHOT:
-            self._check_bdshot_health()
+        self._check_bdshot_health()
         self._send_status_slice()
 
-    def _update_commands(self):
-        # UartLink.poll_commands() 内部已经实现:
-        #   - 从UART读数据 -> FrameReceiver切帧+CRC8校验
-        #   - 应用到 self.link.commands[i].throttle
-        #   - 超过 LINK_TIMEOUT_MS(默认100ms) 没收到有效命令 -> 全部油门清零
-        # 这正是 Pico 侧 failsafe 的需求，直接复用，不重复实现。
-        self.link.poll_commands()
-        for i in range(NUM_ESC):
-            self.throttle[i] = self.link.commands[i].throttle
-
     def _drive_escs(self):
-        if self.mode == MODE_BDSHOT and self.bdshot is not None:
-            for i in range(NUM_ESC):
-                self.bdshot.set_throttle(i, self.throttle[i])
-        elif self.mode == MODE_BACKUP and self.signal_escs is not None:
-            for i in range(NUM_ESC):
-                self.signal_escs[i].set_throttle(self.throttle[i])
+        for i in range(MAX_ESC):
+            cmd = self.link.commands[i]
+            # disabled通道throttle已经在Uart_link里强制为0，这里再兜底一次
+            thr = cmd.throttle if cmd.enabled else 0
+
+            if self.channel_mode[i] == MODE_BDSHOT and self.bdshot is not None \
+                    and self.bdshot.is_motor_active(i):
+                self.bdshot.set_throttle(i, thr)
+            elif self.signal_escs[i] is not None:
+                self.signal_escs[i].set_throttle(thr)
 
     def _check_bdshot_health(self):
+        if self.bdshot is None:
+            return
         self.bdshot_health.update(self.bdshot.motors)
-        if self.bdshot_health.all_stale_duration_ms() > BDSHOT_GLOBAL_FAIL_MS:
-            print(
-                "[main] %d路BDShot遥测同时失联超过 %dms，判定BDShot整体失效"
-                % (NUM_ESC, BDSHOT_GLOBAL_FAIL_MS)
-            )
-            self._switch_to_backup()
+        for i in range(MAX_ESC):
+            if self.channel_mode[i] != MODE_BDSHOT:
+                continue
+            if not self.bdshot.is_motor_active(i):
+                continue
+            if not self.bdshot_health.is_alive(i, BDSHOT_STALE_MS):
+                self._degrade_channel(i)
 
     def _send_status_slice(self):
         # 每 STATUS_PERIOD_MS 发一路状态帧，round-robin 由
@@ -220,8 +217,11 @@ class EscBridge:
         kiss_alive = kp.is_alive(KISS_STALE_MS)
 
         bd_alive = False
-        if self.mode == MODE_BDSHOT and self.bdshot is not None:
+        if self.channel_mode[i] == MODE_BDSHOT and self.bdshot is not None \
+                and self.bdshot.is_motor_active(i):
             bd_alive = self.bdshot_health.is_alive(i)
+
+        st.enabled = self.link.commands[i].enabled
 
         if bd_alive:
             m = self.bdshot.motors[i]

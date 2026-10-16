@@ -138,6 +138,20 @@ irq 号从字面量换成了 rel()。
    数据会在后台自动新鲜起来。`bus.poll()` 仍然保留，手动调用也没
    问题（只是通常不需要了）。
 
+================================================================
+[main.py 单路降级支持] 新增内容说明
+================================================================
+在不改动上面任何 PIO 汇编 / DMA / 时序常量的前提下，`DShotBus`
+类新增了两个纯 Python 层面的接口：`disable_motor(index)` /
+`is_motor_active(index)`。
+
+disable_motor(i) 只做两件事：调用该电机自己的 tx_sm/rx_sm.active(0)
+(即 DShotMotor.close())，并把内部的 `_active[i]` 标记为 False，
+使 Timer 回调(_on_tick)和 schedule 回调(_poll_all)在下一次 tick 起
+自动跳过这一路。因为每路电机的 tx_sm/rx_sm 在硬件上本来就是各自
+独立的状态机(见 _SLOTS 分配)，所以关掉第 i 路完全不影响其余路继续
+按原有时序正常收发。这是 main.py 实现"单路 BDShot 异常只降级这一路"
+的基础。
 """
 
 import rp2
@@ -464,7 +478,7 @@ class DShotMotor:
     def close(self):
         self.tx_sm.active(0)
         self.rx_sm.active(0)
-    
+
     # ---------------- 统一格式的遥测快照 ----------------
     def get_telemetry(self):
         """
@@ -488,6 +502,14 @@ class DShotBus:
     """
     用一个共享 Timer 同步触发所有电机发帧，并用 micropython.schedule
     在后台自动读取/解码遥测（问题4），不再需要用户手动 poll()。
+
+    ---------------------------------------------------------------
+    [main.py 单路降级支持] disable_motor()/is_motor_active()：
+    纯Python层面的开关，不改动上面的PIO汇编/DMA/时序。disable_motor(i)
+    只停止第i路自己的 tx_sm/rx_sm 并从Timer回调的轮询名单里剔除，
+    其余路的 SM 完全不受影响，因为每路电机的 tx_sm/rx_sm 在硬件上
+    本来就是各自独立的状态机(见_SLOTS)。不支持运行时自动恢复。
+    ---------------------------------------------------------------
     """
 
     # 先填 PIO1 的两对，再填 PIO2 的两对。
@@ -511,6 +533,7 @@ class DShotBus:
             DShotMotor(p, slot[0], slot[1], name=n, pole_pairs=pole_pairs)
             for p, slot, n in zip(motor_pins, self._SLOTS, names)
         ]
+        self._active = [True] * len(self.motors)
         self.update_hz = update_hz
         self._timer = machine.Timer()
         self._timer.init(freq=update_hz, mode=machine.Timer.PERIODIC,
@@ -518,8 +541,9 @@ class DShotBus:
 
     # ---- 硬中断上下文：只做不分配内存的操作 ----
     def _on_tick(self, t):
-        for m in self.motors:
-            m._trigger_send()
+        for i, m in enumerate(self.motors):
+            if self._active[i]:
+                m._trigger_send()
         try:
             micropython.schedule(self._poll_all, 0)
         except RuntimeError:
@@ -529,11 +553,28 @@ class DShotBus:
 
     # ---- 由 schedule 在安全上下文里调用，可以分配内存 ----
     def _poll_all(self, _):
-        for m in self.motors:
-            m.poll()
+        for i, m in enumerate(self.motors):
+            if self._active[i]:
+                m.poll()
 
     def set_throttle(self, index, throttle, telemetry=False):
-        self.motors[index].set_throttle(throttle, telemetry)
+        if self._active[index]:
+            self.motors[index].set_throttle(throttle, telemetry)
+
+    def is_motor_active(self, index):
+        """该路是否仍由 BDShot 驱动(True) 还是已单路降级(False)。"""
+        return self._active[index]
+
+    def disable_motor(self, index):
+        """
+        单路降级：只停止第index路的tx_sm/rx_sm，释放其GPIO给
+        Signal_DShot复用。其余路的SM/Timer回调完全不受影响。
+        不支持运行时恢复——恢复只能重启后重新走一次BDShot整体初始化。
+        """
+        if not self._active[index]:
+            return
+        self.motors[index].close()
+        self._active[index] = False
 
     def poll(self):
         """手动强制刷新一次（通常不需要，后台已经自动在做）。"""
@@ -571,19 +612,22 @@ class DShotBus:
 
     def arm_all(self, duration_ms=3000):
         """持续发 throttle=0 让 ESC 完成 arm。"""
-        for m in self.motors:
-            m.set_throttle(0)
+        for i, m in enumerate(self.motors):
+            if self._active[i]:
+                m.set_throttle(0)
         t_end = time.ticks_add(time.ticks_ms(), duration_ms)
         while time.ticks_diff(t_end, time.ticks_ms()) > 0:
             time.sleep_ms(2)   # 不用手动poll了，后台schedule在自动跑
 
     def stop(self):
-        for m in self.motors:
-            m.set_throttle(0)
+        for i, m in enumerate(self.motors):
+            if self._active[i]:
+                m.set_throttle(0)
         time.sleep_ms(50)
         self._timer.deinit()
-        for m in self.motors:
-            m.close()
+        for i, m in enumerate(self.motors):
+            if self._active[i]:
+                m.close()
 
 
 # =====================================================================
@@ -602,7 +646,6 @@ if __name__ == "__main__":
     bus.enable_extended_telemetry(0, True)
     time.sleep_ms(100)
 
-    
     print("ESC EDT 应答:", m.edt_enabled, "(True=已开启, None=还没收到确认帧)")
 
     print("\n开始给油 throttle=600（确认桨已拆！）")
@@ -610,54 +653,10 @@ if __name__ == "__main__":
 
     t_print = time.ticks_ms()
     for _ in range(20000):        # ~10秒
-        # 不需要手动 bus.poll()：Timer回调里已经用 micropython.schedule
-        # 自动在后台把 latest_erpm/voltage/current/temperature 刷新好了。
         if time.ticks_diff(time.ticks_ms(), t_print) >= 500:
             t_print = time.ticks_ms()
             print(m.get_telemetry())
-#             m.debug_dump_raw()
-#             if m.rpm is not None:
-# #                 print("      -> 机械转速 ~= %.0f RPM (7对极)" % m.rpm)
-#                 print(m.rpm)
         time.sleep_ms(2)
-
-    print("停机")
-    bus.stop()
-    
-# =====================================================================
-# 双电机测试：GPIO4，GPIO15 2kHz 更新率，开EDT后打印全部遥测
-# =====================================================================
-# if __name__ == "__main__":
-#     bus = DShotBus(motor_pins=[4,15], update_hz=2000, names=["m0","m1"], pole_pairs=7)
-# 
-#     print("Arming (3s, throttle=0)...")
-#     print("提示：油门0时ESC也会应答(回报'未旋转')，valid应该已经在涨。")
-#     bus.arm_all(3000)
-# 
-#     print("\n开启 Extended DShot Telemetry (命令13，需已armed+油门0)...")
-#     for i in range(len(bus.motors)):
-#         bus.enable_extended_telemetry(i, True)
-#         time.sleep_ms(100)   # 命令之间留点间隔，别挤在一起
-#     
-#     for i, m in enumerate(bus.motors):
-#         print(m.name, "EDT应答:", m.edt_enabled)
-# 
-#     print("\n开始给油 throttle=600（确认桨已拆！）")
-#     for i in range(len(bus.motors)):
-#         bus.set_throttle(i, 600)
-# 
-#     t_print = time.ticks_ms()
-#     for _ in range(20000):        # ~10秒
-#         # 不需要手动 bus.poll()：Timer回调里已经用 micropython.schedule
-#         # 自动在后台把 latest_erpm/voltage/current/temperature 刷新好了。
-#         if time.ticks_diff(time.ticks_ms(), t_print) >= 500:
-#             t_print = time.ticks_ms()
-#             for m in bus.motors:
-#                 print(m.name, m.get_telemetry())
-#         time.sleep_ms(2)
-# 
-#     print("停机")
-#     bus.stop()
 
     print("停机")
     bus.stop()
