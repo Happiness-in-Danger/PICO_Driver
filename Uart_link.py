@@ -14,11 +14,9 @@ Pico 侧 UART 协议实现。
              bit2~0: throttle 的 bit10~8 (高3位)
     buf[3] = throttle 的 bit7~0 (低8位)
     buf[4] = crc8(buf[0:4])
-    throttle 范围 0~2047(11bit)，与原协议完全兼容——原来 buf[2] 的
-    高5位一直是0(因为 thr>>8 最大是7)，这里只是把最高位(bit7)利用起来
-    表示 enable，不占用原有 throttle 编码空间。
+    throttle 范围 0~2047(11bit)。
 
-状态帧 (Pico -> H743)，STATUS_FRAME_LEN=13，字段布局不变:
+状态帧 (Pico -> H743)，STATUS_FRAME_LEN=13:
     buf[0] = SYNC_STATUS (0x5A)
     buf[1] = device_id
     buf[2] = flags: bit0=BDShot有效  bit1=KISS有效  bit2=该路已enable
@@ -41,9 +39,6 @@ UART_TX = 16
 UART_RX = 17
 UART_BAUD = 921600
 
-# 硬件上限固定为4路，不再有可配置的 NUM_ESC。
-# 实际启用几路完全由 H743 通过命令帧里的 enable 位动态决定，
-# Pico 侧代码不需要因为"少插几个电机"而修改。
 MAX_ESC = 4
 
 SYNC_CMD = 0xA5
@@ -127,29 +122,46 @@ class EscCommand:
 
 
 class FrameReceiver:
-    """按sync字节+固定长度+CRC8从字节流里切帧，自动丢字节重新同步。"""
+    """按sync字节+固定长度+CRC8从字节流里切帧，自动丢字节重新同步。
+    注意：部分MicroPython端口的bytearray不支持 del / 变长切片赋值，
+    所以这里用 bytes + 下标游走，最后用切片重新赋值，不做任何原地删除。"""
 
     def __init__(self, sync_byte, frame_len):
         self.sync = sync_byte
         self.frame_len = frame_len
-        self.buf = bytearray()
+        self.buf = b""
+        self.dropped_bytes = 0
+        self.crc_fail = 0
 
     def feed(self, data):
         if data:
-            self.buf.extend(data)
+            self.buf = self.buf + bytes(data)
 
         frames = []
+        buf = self.buf
+        n = len(buf)
+        fl = self.frame_len
+        sync = self.sync
+        pos = 0
+
         while True:
-            while len(self.buf) > 0 and self.buf[0] != self.sync:
-                del self.buf[0]
-            if len(self.buf) < self.frame_len:
+            while pos < n and buf[pos] != sync:
+                pos += 1
+                self.dropped_bytes += 1
+
+            if n - pos < fl:
                 break
-            candidate = bytes(self.buf[:self.frame_len])
+
+            candidate = buf[pos:pos + fl]
+
             if crc8(candidate[:-1]) == candidate[-1]:
-                del self.buf[:self.frame_len]
                 frames.append(candidate)
+                pos += fl
             else:
-                del self.buf[0]
+                pos += 1
+                self.crc_fail += 1
+
+        self.buf = buf[pos:]
         return frames
 
 
@@ -163,7 +175,7 @@ class UartLink:
 
         self._rx = FrameReceiver(SYNC_CMD, CMD_FRAME_LEN)
         self.last_rx_ms = time.ticks_ms()
-        self.LINK_TIMEOUT_MS = 100         # 软超时: 清throttle, 保留enabled
+        self.LINK_TIMEOUT_MS = 150         # 软超时: 清throttle, 保留enabled
         self.LINK_HARD_TIMEOUT_MS = 2000   # 硬超时: 清throttle, 同时清enabled
 
         self._send_idx = 0
@@ -197,7 +209,7 @@ class UartLink:
 
         cmd = self.commands[device_id]
         cmd.enabled = enabled
-        # disabled 通道实际throttle必须为0(需求2)
+        # disabled 通道实际throttle必须为0
         cmd.throttle = thr if enabled else 0
 
     def _soft_failsafe(self):
