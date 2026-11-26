@@ -227,12 +227,14 @@ def decode_telemetry_frame(raw21):
     恰好就是 dshot.c 里 extended_frame_to_send 用的类型码，两者不会
     互相污染，可以安全地用 top nibble 是否等于 2/4/6/E 来分流。
     """
-    gcr20 = 0
-    prev = (raw21 >> 20) & 1
-    for i in range(19, -1, -1):
-        b = (raw21 >> i) & 1
-        gcr20 = (gcr20 << 1) | (b ^ prev)
-        prev = b
+#     gcr20 = 0
+#     prev = (raw21 >> 20) & 1
+#     for i in range(19, -1, -1):
+#         b = (raw21 >> i) & 1
+#         gcr20 = (gcr20 << 1) | (b ^ prev)
+#         prev = b
+
+    gcr20 = (raw21 ^ (raw21 >> 1)) & 0xFFFFF
 
     n0 = _GCR_DECODE_TABLE.get((gcr20 >> 15) & 0x1F)
     n1 = _GCR_DECODE_TABLE.get((gcr20 >> 10) & 0x1F)
@@ -649,10 +651,10 @@ if __name__ == "__main__":
     print("ESC EDT 应答:", m.edt_enabled, "(True=已开启, None=还没收到确认帧)")
 
     print("\n开始给油 throttle=600（确认桨已拆！）")
-    m.set_throttle(500)
+    m.set_throttle(2000)
 
     t_print = time.ticks_ms()
-    for _ in range(20000):        # ~10秒
+    for _ in range(10000):        # ~10秒
         if time.ticks_diff(time.ticks_ms(), t_print) >= 500:
             t_print = time.ticks_ms()
             print(m.get_telemetry())
@@ -660,3 +662,89 @@ if __name__ == "__main__":
 
     print("停机")
     bus.stop()
+
+# =====================================================================
+# 双电机测试：GPIO3 + GPIO7（与 main.py 的 MOTOR_PINS 前两路一致）
+# 两路落在 PIO1 的 local_pair 0 / 1，正好用来验证 rel() 相对寻址
+# 握手在同一个 block 里不串台。
+# 注意：不要 import KISS_Telemetry，它占用 GPIO2/6/10/14，PIO0 与本测试无关。
+# =====================================================================
+if __name__ == "__main__":
+    PINS = [3, 7]
+    bus = DShotBus(motor_pins=PINS, update_hz=2000,
+                   names=["m0", "m1"], pole_pairs=7)
+    m0, m1 = bus.motors
+
+    def print_both(tag=""):
+        for m in (m0, m1):
+            t = m.get_telemetry()
+            print("%s[%s] erpm=%s rpm=%s T=%s V=%s I=%s edt=%s | raw=%d ok=%d err=%d"
+                  % (tag, m.name, t["erpm"], t["rpm"], t["Temp"], t["Voltage"],
+                     t["Current"], t["edt"], m.raw_frames, m.valid_frames,
+                     m.error_frames))
+
+    def run_for(ms, period_ms=500):
+        t_end = time.ticks_add(time.ticks_ms(), ms)
+        t_print = time.ticks_ms()
+        while time.ticks_diff(t_end, time.ticks_ms()) > 0:
+            if time.ticks_diff(time.ticks_ms(), t_print) >= period_ms:
+                t_print = time.ticks_ms()
+                print_both()
+                print("-" * 40)
+            time.sleep_ms(2)
+
+    try:
+        # ---- 1) Arm：两路同时发 throttle=0 ----
+        print("Arming 两路 (3s, throttle=0)...")
+        bus.arm_all(3000)
+
+        # ---- 2) 握手自检：两路的 valid 帧数都必须在涨 ----
+        v0, v1 = m0.valid_frames, m1.valid_frames
+        time.sleep_ms(500)
+        d0, d1 = m0.valid_frames - v0, m1.valid_frames - v1
+        print("0.5s 内新增有效帧: m0=%d  m1=%d" % (d0, d1))
+        if d0 == 0 or d1 == 0:
+            print("!! 有一路没有收到遥测，按顺序排查：")
+            print("   1) 该路ESC是否开启 Bidirectional DShot / 信号线、共地")
+            print("   2) 两路都没有 -> 检查 PIO 程序是否加载成功")
+            print("   3) 只有一路没有 -> 怀疑 rel() 握手，改 _SLOTS=((1,0),(2,0)) 再测")
+            m0.debug_dump_raw()
+            m1.debug_dump_raw()
+
+        # ---- 3) 依次开启两路的 EDT（命令13，需 armed + 油门0）----
+        for i in (0, 1):
+            print("开启 m%d 的 EDT..." % i)
+            bus.enable_extended_telemetry(i, True)
+            time.sleep_ms(100)
+        print("EDT 应答: m0=%s m1=%s" % (m0.edt_enabled, m1.edt_enabled))
+
+        # ---- 4) 独立性测试：只转 m0，m1 保持 0 ----
+        print("\n[阶段A] 只给 m0 油门 300（确认桨已拆！）")
+        bus.set_throttle(0, 300)
+        bus.set_throttle(1, 0)
+        run_for(3000)
+
+        # ---- 5) 只转 m1，m0 停 ----
+        print("\n[阶段B] 只给 m1 油门 300")
+        bus.set_throttle(0, 0)
+        bus.set_throttle(1, 300)
+        run_for(3000)
+
+        # ---- 6) 两路同时转，油门不同，验证遥测不串台 ----
+        print("\n[阶段C] m0=300, m1=600 同时转（rpm 应明显不同）")
+        bus.set_throttle(0, 300)
+        bus.set_throttle(1, 600)
+        run_for(5000)
+
+        # ---- 7) 汇总 ----
+        print("\n结果汇总:")
+        for m in (m0, m1):
+            print("[%s] raw=%d valid=%d err=%d types=%s"
+                  % (m.name, m.raw_frames, m.valid_frames,
+                     m.error_frames, m.type_counts))
+
+    except KeyboardInterrupt:
+        print("用户中断")
+    finally:
+        print("停机")
+        bus.stop()
