@@ -83,7 +83,7 @@ if len(MOTOR_PINS) != MAX_ESC:
 DEGRADE_SM = [(4, 1), (6, 1), (8, 2), (10, 2)]
 
 POLE_PAIRS = 1
-UPDATE_HZ = 2000                # BDShot 内部 Timer 更新率
+UPDATE_HZ = 500                # BDShot 内部 Timer 更新率
 
 BDSHOT_STALE_MS = 300           # 单路 BDShot 遥测超过这个时间没有新的有效帧 -> 该路判定异常，触发单路降级
 KISS_STALE_MS = 1000            # 直接复用 KissTelemParser.is_alive() 的默认超时量级
