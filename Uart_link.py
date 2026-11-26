@@ -175,7 +175,7 @@ class UartLink:
 
         self._rx = FrameReceiver(SYNC_CMD, CMD_FRAME_LEN)
         self.last_rx_ms = time.ticks_ms()
-        self.LINK_TIMEOUT_MS = 150         # 软超时: 清throttle, 保留enabled
+        self.LINK_TIMEOUT_MS = 100         # 软超时: 清throttle, 保留enabled
         self.LINK_HARD_TIMEOUT_MS = 2000   # 硬超时: 清throttle, 同时清enabled
 
         self._send_idx = 0
